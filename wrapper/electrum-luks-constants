@@ -1,0 +1,50 @@
+#
+# login account in the Live environment
+#
+ACCOUNT="${USER}"
+
+#
+# Electrum
+#
+ELECTRUM_DIR='/opt/electrum/'  # the directory a version of Electrum is installed
+ELECTRUM_INSTALLATION_GLOB='Electrum-[[:digit:]]*'  # file glob pattern to identify the Electrum installation
+ELECTRUM_SCRIPT_NAME='electrum'  # Electrum original program name
+ELECTRUM_PACKAGED_SCRIPT_NAME='run_electrum'  # The program name of the packaged Electrum that doesn't require
+                                              # installation of Electrum and dependency libraries into Python library paths.
+ELECTRUM_WALLET_DIR='wallets'  # wallets directory within Electrum data directory
+
+#
+# Wallet data storage
+#
+# Directory organization is as follows.
+#   data partition filesystem label: EDATA
+#   data partition filesystem mount point: /media/${ACCOUNT}/EDATA
+#   data partition filesystem LUKS container file when media is mounted: /media/${ACCOUNT}/EDATA/electrum/electrum_data.fs
+#   mount point for LUKS filesystem: /data_dir/electrum
+#   Electrum data directory when LUKS is mounted: /data_dir/electrum/.electrum
+#   Electrum wallet directory when LUKS is mounted: /data_dir/electrum/.electrum/wallets
+#   wallet metadata directory when LUKS is mounted: /data_dir/electrum/metadata
+#
+WALLET_MEDIA_VOLUME_LABEL='EDATA'    # filesystem label of the wallet data media partition.
+WALLET_MEDIA_MOUNT_POINT="/media/${ACCOUNT}/${WALLET_MEDIA_VOLUME_LABEL}"    # mount point for the wallet media filesystem
+MEDIA_WALLET_DIRECTORY="electrum"    # top level directory within the wallet media filesystem.
+WALLET_CONTAINER_FILE="${MEDIA_WALLET_DIRECTORY}/electrum_data.fs"    # container file for the LUKS encrypted filesystem
+LUKS_WALLET_DEVICE_NAME='electrum_data_volume'    # device name used to mount LUKS encrypted filesystem
+LUKS_WALLET_MOUNT_POINT='/data_dir/electrum'    # directory to mount the LUKS filesystem
+LUKS_ELECTRUM_DATA_DIR='.electrum'    # Electrum data directory within the LUKS filesystem
+LUKS_WALLET_METADATA_DIR='metadata'    # metadata directory within the LUKS filesystem
+
+#
+# Scripts
+#
+SCRIPT_ELECTRUM_WRAPPER='electrum-offline-wrapper'
+SCRIPT_LUKS_SETUP_WALLET='luks-setup-wallet-dir'
+SCRIPT_SAVE_WALLET_METADATA='save-wallet-metadata'
+SCRIPT_DISPLAY_WALLET_METADATA='display-wallet-metadata'
+SCRIPT_LUKS_CHANGE_PASSPHRASE='luks-change-passphrase'
+SCRIPT_LUKS_ADD_PASSPHRASE='luks-add-passphrase'
+
+#
+# Others
+#
+PINENTRY_TIMEOUT='600'  # GPG pinentry timeout in seconds; used to customize ${HOME}/.gnupg/gpg-agent.conf

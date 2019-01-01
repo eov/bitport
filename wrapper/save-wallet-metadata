@@ -1,0 +1,80 @@
+#!/bin/bash
+# -*- mode: sh; coding: utf-8; -*-
+
+# Script
+#   save-wallet-metadata
+#
+# Assumption
+# - The script electrum-offline-wrapper was already run to create one or more wallets that were stored withn the LUKS encrypted volume.
+# - The wallet data filesystem (with the label ${WALLET_MEDIA_VOLUME_LABEL}) on the USB flash drive is already mounted.
+#
+# Function
+# - Make sure another instance of our scripts are not running.
+# - Check if the wallet data filesystem of the USB drive is mounted at the prescribed location.
+# - Open and mount the encrypted wallet LUKS volume (by interactively asking the user for the LUKS passphrase).
+# - Interactively select a wallet within the Electrum wallets directory and present a dialog to save its metadata (including the seed phrase).
+# - Present a dialog for the GPG passphrase for symmetric cipher.
+# - Save the metadata in a GPG encrypted file within the LUKS volume.
+# - After finishing, unmount and close the encrypted LUKS volume.
+#
+# Logging
+# - Logging information will be displayed in one of the yad window for inspection purpose,
+#   but will not be saved in any files.
+#
+
+script_path=$(/usr/bin/realpath "$0")
+script_name=$(/usr/bin/basename "$0")
+script_dir=$(/usr/bin/dirname "${script_path}")
+source "${script_dir}/common-utils"
+
+
+main() {
+
+    check_script_instance "${SCRIPT_LUKS_SETUP_WALLET}"
+    check_script_instance "${SCRIPT_ELECTRUM_WRAPPER}"
+    check_script_instance "${SCRIPT_SAVE_WALLET_METADATA}"
+    check_script_instance "${SCRIPT_DISPLAY_WALLET_METADATA}"
+    check_script_instance "${SCRIPT_LUKS_CHANGE_PASSPHRASE}"
+    check_script_instance "${SCRIPT_LUKS_ADD_PASSPHRASE}"
+
+    local logging_window="Save Wallet Metadata Logging"
+    setup_logging_coproc "${logging_window}"
+
+    local container_file_path="${WALLET_MEDIA_MOUNT_POINT}/${WALLET_CONTAINER_FILE}"
+    local electrum_wallet_dir_path="${LUKS_WALLET_MOUNT_POINT}/${LUKS_ELECTRUM_DATA_DIR}/${ELECTRUM_WALLET_DIR}"
+    local wallet_metadata_dir="${LUKS_WALLET_MOUNT_POINT}/${LUKS_WALLET_METADATA_DIR}"
+
+    #--- load the wallet LUKS volume
+
+    check_media_mount "${WALLET_MEDIA_MOUNT_POINT}"
+
+    load_dm_crypt
+
+    make_mount_point "${LUKS_WALLET_MOUNT_POINT}"
+
+    local passphrase
+    luks_open "${container_file_path}" "${LUKS_WALLET_DEVICE_NAME}" passphrase
+
+    luks_mount "${LUKS_WALLET_DEVICE_NAME}" "${LUKS_WALLET_MOUNT_POINT}"
+
+    #--- save wallet metadata
+    if [ ! -e "${electrum_wallet_dir_path}" ]; then
+        info "Can't access the Electrum wallet directory ${electrum_wallet_dir_path}."
+    elif [ ! -e "${wallet_metadata_dir}" ]; then
+        info "Can't access the wallet metadata directory ${wallet_metadata_dir}."
+    else
+        save_metadata "${electrum_wallet_dir_path}" "${wallet_metadata_dir}"
+    fi
+
+    #--- close the wallet LUKS volume
+
+    luks_umount "${LUKS_WALLET_MOUNT_POINT}"
+
+    luks_close "${LUKS_WALLET_DEVICE_NAME}"
+
+    allsteps_done "${logging_window}"
+
+    wait_coproc
+}
+
+main

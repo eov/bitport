@@ -1,0 +1,98 @@
+#!/bin/bash
+# -*- mode: sh; coding: utf-8; -*-
+
+# Script
+#   luks-setup-wallet-dir
+#
+# Assumption
+# - The USB flash drive has the partition with the filesystem that has the volume label ${WALLET_MEDIA_VOLUME_LABEL}.
+#   This partition is used to store wallet data.
+# - The wallet data filesystem of the USB flash drive is already mounted at ${WALLET_MEDIA_MOUNT_POINT}.
+# - The wallet data filesystem has adequate unused space for the LUKS volume.
+#   (It doesn't consume too large space, but requires less than a few hundred megabytes.)
+#
+# Function
+# - Make sure another instance of our scripts are not currently running.
+# - Check if the wallet data filesystem of the USB drive is mounted at the prescribed location.
+#   The USB drive is required to have a partition with a filesystem having the volume label ${WALLET_MEDIA_VOLUME_LABEL}.
+# - Create the top directory ${MEDIA_WALLET_DIRECTORY} in this filesystem.
+# - Create the LUKS encrypted volume within the container file ${WALLET_CONTAINER_FILE} under the directory
+#   ${MEDIA_WALLET_DIRECTORY} (by interactively asking the user for the LUKS passphrase).
+#   The cryptsetup type used is LUKS2 with its default cipher: aes-xts-plain64, and default keysize: 256 bits.
+# - Create the wallet data directory ${LUKS_ELECTRUM_DATA_DIR} within the LUKS volume.
+# - Create the wallet metadata directory ${LUKS_WALLET_METADATA_DIR} within the LUKS volume.
+# - Unmount and close the LUKS volume.
+#
+# Errors
+# - User dialogs can be canceled to exit the script at any time so that the same script can be safely run later.
+# - If an error happens within luks_mkfs or luks_mount after completing luks_open,
+#   the code will try closing the LUKS device as much as possible so that LUKS device is not left exposed.
+#
+# Restriction
+# - The following characters are not allowed within the passphrase dialog:
+#     Null, Control-J (LF) and Control-K (VT).
+#   Control-K is used as the custom field separator for yad.
+#   Control-J is interpreted as the input record separator by sed and cut.
+# - Other control characters are allowed as well as normal printable characters including ASCII and Unicode.
+#   However cryptsetup document recommends 7-bit ASCII characters for passphrases,
+#   so the use of control characters within passphrases should be for advanced users only.
+#
+# Logging
+# - Logging information will be displayed in one of the yad window for inspection purpose,
+#   but will not be saved in any files.
+#
+
+script_path=$(realpath "$0")
+script_dir=$(dirname "${script_path}")
+
+source "${script_dir}/common-utils"
+
+
+luks_prepare() {
+
+    check_electrum
+    check_script_instance "${SCRIPT_LUKS_SETUP_WALLET}"
+    check_script_instance "${SCRIPT_ELECTRUM_WRAPPER}"
+    check_script_instance "${SCRIPT_SAVE_WALLET_METADATA}"
+    check_script_instance "${SCRIPT_DISPLAY_WALLET_METADATA}"
+    check_script_instance "${SCRIPT_LUKS_CHANGE_PASSPHRASE}"
+    check_script_instance "${SCRIPT_LUKS_ADD_PASSPHRASE}"
+
+    local logging_window="LUKS encrypted volume setup logging"
+    local media_data_directory_path="${WALLET_MEDIA_MOUNT_POINT}/${MEDIA_WALLET_DIRECTORY}"
+    local container_file_path="${WALLET_MEDIA_MOUNT_POINT}/${WALLET_CONTAINER_FILE}"
+
+    setup_logging_coproc "${logging_window}"
+
+    check_media_mount "${WALLET_MEDIA_MOUNT_POINT}"
+
+    load_dm_crypt
+
+    mkdir_data_dir "${media_data_directory_path}"
+
+    make_mount_point "${LUKS_WALLET_MOUNT_POINT}"
+
+    create_container "${WALLET_MEDIA_MOUNT_POINT}" "${container_file_path}"
+
+    local passphrase
+    luks_format "${container_file_path}" passphrase
+
+    luks_open "${container_file_path}" "${LUKS_WALLET_DEVICE_NAME}" passphrase
+
+    luks_mkfs "${LUKS_WALLET_DEVICE_NAME}"
+
+    luks_mount "${LUKS_WALLET_DEVICE_NAME}" "${LUKS_WALLET_MOUNT_POINT}"
+
+    luks_create_top_dir "${LUKS_WALLET_MOUNT_POINT}" "${LUKS_ELECTRUM_DATA_DIR}" "${LUKS_WALLET_DEVICE_NAME}"
+    luks_create_top_dir "${LUKS_WALLET_MOUNT_POINT}" "${LUKS_WALLET_METADATA_DIR}" "${LUKS_WALLET_DEVICE_NAME}"
+
+    luks_umount "${LUKS_WALLET_MOUNT_POINT}"
+
+    luks_close "${LUKS_WALLET_DEVICE_NAME}"
+
+    allsteps_done "${logging_window}"
+
+    wait_coproc
+}
+
+luks_prepare

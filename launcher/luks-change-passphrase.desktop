@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=LUKS Change Passphrase
+GenericName=Electrum Wallet Utility
+Comment=Electrum wallet utility to replace one of the old passphrases with a new one for LUKS filesystem
+Icon=/usr/share/icons/Adwaita/512x512/actions/document-properties.png
+Exec=/opt/electrum/wrapper/luks-change-passphrase
+NoDisplay=false
+Categories=Finance;Network;
+MimeType=x-scheme-handler/bitcoin;
+StartupNotify=false
+Terminal=false

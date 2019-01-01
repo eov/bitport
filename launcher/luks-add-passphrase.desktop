@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=LUKS Add Passphrase
+GenericName=Electrum Wallet Utility
+Comment=Electrum wallet utility to add a new passphrase for LUKS filesystem
+Icon=/usr/share/icons/Adwaita/512x512/actions/document-new.png
+Exec=/opt/electrum/wrapper/luks-add-passphrase
+NoDisplay=false
+Categories=Finance;Network;
+MimeType=x-scheme-handler/bitcoin;
+StartupNotify=false
+Terminal=false

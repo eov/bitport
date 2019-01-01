@@ -1,0 +1,155 @@
+#!/bin/bash
+# -*- mode: sh; coding: utf-8; -*-
+
+# Script
+#   display-wallet-metadata
+#
+# Assumption
+# - The script save-wallet-metadata was already run to save wallet metadata withn the LUKS encrypted volume.
+# - The wallet data filesystem (with the label ${WALLET_MEDIA_VOLUME_LABEL}) on the USB flash drive is already mounted.
+#
+# Function
+# - Make sure another instance of our scripts are not running.
+# - Check if the wallet data filesystem of the USB drive is mounted at the prescribed location.
+# - Open and mount the encrypted wallet LUKS volume (by interactively asking the user for the LUKS passphrase).
+# - Interactively select a wallet metadata file within the metadata directory and present a dialog for the GPG passphrase for the metadata.
+# - Present a dialog to display its metadata.
+# - After finishing, unmount and close the encrypted LUKS volume.
+#
+# Note
+# - Displayed metadata is never written in plaintext to any file.
+#
+# Logging
+# - Logging information will be displayed in one of the yad window for inspection purpose,
+#   but will not be saved in any files.
+#
+
+script_path=$(/usr/bin/realpath "$0")
+script_name=$(/usr/bin/basename "$0")
+script_dir=$(/usr/bin/dirname "${script_path}")
+source "${script_dir}/common-utils"
+
+
+main() {
+
+    check_script_instance "${SCRIPT_LUKS_SETUP_WALLET}"
+    check_script_instance "${SCRIPT_ELECTRUM_WRAPPER}"
+    check_script_instance "${SCRIPT_SAVE_WALLET_METADATA}"
+    check_script_instance "${SCRIPT_DISPLAY_WALLET_METADATA}"
+    check_script_instance "${SCRIPT_LUKS_CHANGE_PASSPHRASE}"
+    check_script_instance "${SCRIPT_LUKS_ADD_PASSPHRASE}"
+
+    local logging_window="Display Wallet Metadata Logging"
+    setup_logging_coproc "${logging_window}"
+
+    local container_file_path="${WALLET_MEDIA_MOUNT_POINT}/${WALLET_CONTAINER_FILE}"
+    local wallet_metadata_dir="${LUKS_WALLET_MOUNT_POINT}/${LUKS_WALLET_METADATA_DIR}"
+
+    #--- load the wallet LUKS volume
+
+    check_media_mount "${WALLET_MEDIA_MOUNT_POINT}"
+
+    load_dm_crypt
+
+    make_mount_point "${LUKS_WALLET_MOUNT_POINT}"
+
+    local passphrase
+    luks_open "${container_file_path}" "${LUKS_WALLET_DEVICE_NAME}" passphrase
+
+    luks_mount "${LUKS_WALLET_DEVICE_NAME}" "${LUKS_WALLET_MOUNT_POINT}"
+
+    #--- display wallet metadata
+    if [ ! -e "${wallet_metadata_dir}" ]; then
+        info "Can't access the wallet metadata directory."
+    else
+        display_metadata_loop "${wallet_metadata_dir}"
+    fi
+
+    #--- close the wallet LUKS volume
+
+    luks_umount "${LUKS_WALLET_MOUNT_POINT}"
+
+    luks_close "${LUKS_WALLET_DEVICE_NAME}"
+
+    allsteps_done "${logging_window}"
+
+    wait_coproc
+}
+
+display_metadata_loop() {
+    local wallet_metadata_dir="$1"
+
+    local status_var
+    while [ "${status_var}" != '1' ]; do
+        status_var='0'
+        display_metadata "${wallet_metadata_dir}" status_var
+    done
+}
+
+display_metadata() {
+    local wallet_metadata_dir="$1"
+    local -n status="$2"  # nameref of the variable declared in the caller.
+    # status '0' : continue try
+    # status '1' : canceled file selection or canceled gpg
+    # status '2' : succeeded gpg
+
+    local dialog_output=$(
+        /usr/bin/yad \
+            --file \
+            --filename="${wallet_metadata_dir}" \
+            --title 'Display wallet metadata' \
+            --text '<b>Select metadata file to display its content.\nTo quit press Cancel.\n</b>' \
+            --image 'dialog-question' --window-icon='dialog-question' \
+            --borders=12 --fixed --no-escape)
+    if [ -z "${dialog_output}" ]; then
+        status='1'
+        log_info 'No metadata file was selected.'
+        return
+    fi
+    local wallet_metadata_path="${dialog_output}"
+    local wallet_metadata_file=$(/usr/bin/basename "${wallet_metadata_path}")
+
+    # loop to allow GPG passphrase errors
+    local errfile=$(/bin/mktemp)
+    local gpg_output
+    local exit_code
+    local gpg_error
+    local wallet_metadata
+    while [ "${status}" = '0' ]; do
+        log_info "Inquiring of the GPG passphrase for the metadata file ${wallet_metadata_path}."
+        gpg_output=$(/usr/bin/gpg --decrypt --output - "${wallet_metadata_path}" 2> "${errfile}")
+        exit_code="$?"
+        gpg_error=$(/bin/cat "${errfile}")
+        if [ "${exit_code}" != '0' ]; then
+            /usr/bin/yad \
+                --image 'dialog-warning' \
+                --window-icon 'dialog-warning' \
+                --title 'GPG decrypt metadata file' \
+                --text "<b>Error:</b>\n${gpg_error}\n\n<b>Try entering the passphrase again?</b>\n" \
+                --button 'Cancel:1' --button 'OK:0' --no-escape \
+                --borders 12 --center --on-top --fixed
+            status="$?"
+        else
+            status='2'
+            wallet_metadata="${gpg_output}"
+            # display the wallet metadata
+            /bin/echo -En "${wallet_metadata}" | \
+                /usr/bin/yad \
+                    --text-info \
+                    --image 'dialog-information' \
+                    --window-icon 'dialog-information' \
+                    --title 'Wallet Metadata' \
+                    --show-cursor \
+                    --button 'OK:0' --no-escape \
+                    --width 600 --height 280 --borders 12 --center
+        fi
+    done
+    /bin/rm "${errfile}"
+    if [ "${status}" = '1' ]; then
+        log_info "Failed in GPG decryption of the metadata file ${wallet_metadata_path}."
+    elif [ "${status}" = '2' ]; then
+        log_info "Success in GPG decryption of the metadata file ${wallet_metadata_path}."
+    fi
+}
+
+main

@@ -1,0 +1,1090 @@
+# -*- mode: sh; coding: utf-8; -*-
+
+source "${script_dir}/electrum-luks-constants"
+
+
+find_installed_electrum() {
+    local electrum_dir="$1"
+    local -n electrum_version_ref="$2"  # nameref of the variable used in the caller.
+    # Function:
+    # Find the subdirectory that matches the glob pattern ${ELECTRUM_INSTALLATION_GLOB} under ${electrum_dir}
+    # and return the value as nameref electrum_version_ref.
+    # Throw an error if there is no or more than one such subdirectory.
+
+    if [ ! -d "${electrum_dir}" ]; then
+        /bin/echo "error: ${electrum_dir} is not a directory."
+    fi
+
+    local ELECTRUM_INSTALLATION_GLOB="Electrum-[[:digit:]]*"
+
+    cd "${electrum_dir}"
+    shopt -s nullglob
+    local dir_entries=(${ELECTRUM_INSTALLATION_GLOB})
+    shopt -u nullglob
+
+    local subdirs=()
+    for entry in "${dir_entries[@]}"; do
+        if [ -d "${entry}" ]; then
+            subdirs+=("${entry}")
+        fi
+    done
+    if [ "${#subdirs[@]}" = 0 ]; then
+        /bin/echo "error: can't find any Electrum installation under ${electrum_dir}."
+    elif [ "${#subdirs[@]}" = 1 ]; then
+        electrum_version_ref="${subdirs[0]}"
+    else
+        /bin/echo "error: found more than a single installation of Electrum under ${electrum_dir}."
+    fi
+}
+
+check_electrum() {
+    # Function:
+    # Check if electrum is running.
+
+    check_script_instance "${ELECTRUM_PACKAGED_SCRIPT_NAME}"
+
+    check_script_instance "${ELECTRUM_SCRIPT_NAME}"
+
+    check_script_instance "${SCRIPT_ELECTRUM_WRAPPER}"
+}
+
+check_script_instance() {
+    local script="$1"
+    # Function:
+    # Check if another instance of ${script} is running.
+    # Note:
+    # This function will give a wrong result if it is run within a subshell.
+
+    # pgrep sees only first 15 characters of the command name.
+    local script_15=$(/bin/echo -En "${script}" | /usr/bin/cut -c 1-15)
+
+    local output=($(/usr/bin/pgrep "${script_15}"))
+    local pid
+    local pids=()
+    for pid in "${output[@]}"; do
+        if [ "${pid}" != "${BASHPID}" ]; then
+            pids+=("${pid}")
+        fi
+    done
+    if [ "${#pids[@]}" != 0 ]; then
+        fatal "${script} is already running with process ID: ${output}."
+    fi
+}
+
+check_media_mount() {
+    local media_mount_point="$1"
+    # Function:
+    # Check if media is mounted at ${media_mount_point}.
+
+    log_info "Checking if media is mounted at ${media_mount_point}."
+    /bin/mountpoint -q "${media_mount_point}"
+    if [ "$?" != '0' ]; then
+        fatal "Media filesystem is not mounted at ${media_mount_point}. Please mount it first."
+    fi
+}
+
+mkdir_data_dir() {
+    local data_directory="$1"
+    # Function:
+    # Create ${data_directory} to be owned by ${ACCOUNT}
+
+    local output
+    if [ -d "${data_directory}" ]; then
+        log_info "The directory ${data_directory} already exists."
+    else
+        log_info "Creating directory ${data_directory}."
+        output=$(/usr/bin/sudo /bin/mkdir "${data_directory}" 2>&1)
+        if [ "$?" != '0' ]; then
+            fatal "Failed creating ${data_directory}; ${output}"
+        fi
+        output=$(/usr/bin/sudo /bin/chown "${ACCOUNT}" "${data_directory}" 2>&1)
+        if [ "$?" != '0' ]; then
+            fatal "Failed chown ${data_directory}; ${output}"
+        fi
+    fi
+}
+
+make_mount_point() {
+    local mount_point="$1"
+    # Function:
+    # Create the mount point ${mount_point}.
+
+    if [ -e "${mount_point}" ]; then
+        if [ -d "${mount_point}" ]; then
+            log_info "The mount target directory ${mount_point} exists."
+        else
+            fatal "${mount_point} should be a directory but a file."
+        fi
+    else
+        log_info "Creating the mount target directory ${mount_point}."
+        local output
+        output=$( /usr/bin/sudo /bin/mkdir --parents "${mount_point}" 2>&1)
+        if [ "$?" != '0' ]; then
+            fatal "Failed creating the mount target ${mount_point}!; ${output}"
+        fi
+    fi
+}
+
+create_container() {
+    local media_mount_point="$1"
+    local container_file="$2"
+    # Function:
+    # Create a regular file ${container_file} within the host filesystem.
+    # The user can cancel the dialog to stop the whole process.
+
+    if [ -e "${container_file}" ]; then
+        log_info "The container file ${container_file} already exists."
+    else
+        log_info "Checking available space on ${media_mount_point}."
+        local available_mb=$(/bin/df --output=avail --block-size=1M "${media_mount_point}" | /bin/grep -v 'Avail')
+
+        local minimum_clearance_mb='100'
+        local suggested_size_mb='50'
+        local minimum_size_mb='20'
+        local maximum_size_mb=$(("${available_mb}" - "${minimum_clearance_mb}"))
+
+        if [ "${maximum_size_mb}" -lt "${minimum_size_mb}" ]; then
+            fatal "Available space ${available_mb} MB on the filesystem is too small!"
+            return
+        fi
+        if [ "${suggested_size_mb}" -ge "${maximum_size_mb}" ]; then
+            suggested_size_mb="${maximum_size_mb}"
+        fi
+
+        local text1="<b>Specify the LUKS container file size in MB.\n</b>"
+        local text2="<b>Recommended size is around ${minimum_size_mb} MB ~ 100 MB.\n</b>"
+        local text3="(The media partition has about ${available_mb} MB unused space.)\n"
+        local dialog_output=$(/usr/bin/yad \
+                                  --form \
+                                  --title 'LUKS container file' \
+                                  --field='LUKS container file size (MB):NUM' "${suggested_size_mb}!${minimum_size_mb}..${maximum_size_mb}!1" \
+                                  --text "${text1}${text2}${text3}" \
+                                  --image 'dialog-question' --window-icon='dialog-question' \
+                                  --center --borders=12 --no-escape)
+        if [ -z "${dialog_output}" ]; then
+            fatal "No size was entered for the container file."
+        fi
+        local container_mb=$(/bin/echo "${dialog_output}" | sed -e 's/|$//')
+
+        text1="<b>Going to create a LUKS container file</b>\n  ${container_file}\n"
+        text2="<b>of the size</b> ${container_mb} <b>MB within the media partition and\n"
+        text3="fill the file content with random bytes from /dev/urandom.</b>"
+        /usr/bin/yad \
+            --title 'LUKS container file' \
+            --text "${text1}${text2}${text3}" \
+            --button 'Cancel:2' --button 'OK:0' --no-escape \
+            --image dialog-information --window-icon dialog-information \
+            --center --borders=12 --fixed
+        local status="$?"
+        if [ "${status}" != '0' ]; then
+            fatal "User canceled creation of container file."
+        fi
+
+        log_info "Creating the encrypted volume container file ${container_file} of size ${container_mb} MB."
+        local output
+        output=$(/bin/dd if=/dev/urandom of="${container_file}" bs=1M count="${container_mb}" 2>&1)
+        status="$?"
+        if [ "${status}" != '0' ]; then
+            fatal "Failed creating the container file ${container_file}; ${output}"
+        fi
+    fi
+}
+
+load_dm_crypt() {
+    # Function:
+    # load kernel module dm-crypt
+
+    log_info 'Loading the kernel module dm-crypt'
+    if ! /usr/bin/sudo /sbin/modprobe dm-crypt; then
+        fatal 'Failed loading kernel module dm-crypt.'
+    fi
+}
+
+luks_format() {
+    local container_file="$1"
+    local -n passphrase_ref="$2"  # nameref of the variable used in the caller.
+    # Function:
+    # Format the regular file "${container_file}" as a LUKS container.
+    # The value of passphrase_ref will be set to the new passphrase the user will enter in the passphrase dialog presented.
+    # The user can cancel the dialog to stop the whole process.
+
+    local text1 text2 text3 text4 text5 text6 text7 text8
+
+    if /sbin/cryptsetup isLuks "${container_file}"; then
+        log_info "LUKS volume is already set up within the container file."
+        text1="<b>The file</b> ${container_file} <b>is already LUKS formated.\n"
+        text2='Forcefully reformatting it will lead to loss data stored within the LUKS volume.\n'
+        text3='If you really need to reformat it you need to manually delete the container file first.</b>'
+        /usr/bin/yad \
+            --title "${passphrase_title}" \
+            --text "${text1}${text2}${text3}" \
+            --button 'OK:0' --no-escape \
+            --image 'dialog-information' --window-icon 'dialog-information' \
+            --center --borders 12 --fixed
+    else
+        text1='<b>We are going to create a LUKS encrypted filesystem.</b>\n\n'
+        text2='<b>The next dialog will ask for the LUKS volume passphrase.\nDo you want to have the passphrase hidden or shown as you type?</b>\n\n'
+        text3='<b>Passphrase suggestion</b>:\n'
+        text4='One of the ways to generate strong passphrases is to use /usr/bin/diceware\n'
+        text5='See\n'
+        text6='  https://blogs.dropbox.com/tech/2012/04/zxcvbn-realistic-password-strength-estimation/\n'
+        text7='  http://world.std.com/~reinhold/diceware.html\n\n'
+        text8='<b>(*) Please remember to keep your passphrase in multiple safe places!</b>\n\n'
+
+        luks_passphrase_double_check "${text1}${text2}${text3}${text4}${text5}${text6}${text7}${text8}" passphrase_ref
+        if [ "${passphrase_ref}" = '' ]; then
+            fatal "No passphrase was given. Exiting."
+        fi
+        text1='<b>Entered passphrases matched.\n'
+        text2='The passphrase is going to be used for LUKS volume encryption.\n\n'
+        text3='Note: Formatting a LUKS volume could take more than a few seconds.</b>\n'
+        /usr/bin/yad \
+            --title "${passphrase_title}" \
+            --text "${text1}${text2}${text3}" \
+            --button 'OK:0' --no-escape \
+            --image 'dialog-information' --window-icon 'dialog-information' \
+            --center --borders 12 --fixed
+
+        log_info "Setting up a LUKS volume within the container file."
+        # special characters possibly included in passphrase will not get interpreted by echo
+        local output
+        output=$( /bin/echo -En "${passphrase_ref}" | /sbin/cryptsetup --align-payload=1 --type luks2 luksFormat "${container_file}" - 2>&1 )
+        if [ "$?" = '0' ]; then
+            log_info "Successfully formated the LUKS volume within the container file."
+        else
+            fatal "Failed setting up a LUKS volume ${output}"
+        fi
+    fi
+}
+
+luks_open() {
+    local container_file="$1"
+    local luks_volume_name="$2"
+    local -n passphrase_ref2="$3"  # nameref of the variable used in the caller.
+    # Function:
+    # Open the LUKS volume "${luks_volume_name}" on the LUKS container file "${container_file}".
+    # If passphrase_ref2 has a value it will be used to open LUKS volume.
+    # If passphrase_ref2 has no value the dialog will be presented to the user for the passphrse.
+    # The user can cancel the dialog to stop the whole process.
+
+    log_info "Checking whether ${container_file} is opened."
+    local text1 text2 text3
+    local output
+    output=$( /usr/bin/sudo /sbin/cryptsetup status "${luks_volume_name}" 2>&1)
+    local exit_code="$?"
+    if [ "${exit_code}" = '0' ]; then
+        log_info "LUKS volume ${luks_volume_name} is already opened."
+    elif [ "${exit_code}" = '1' ]; then
+        fatal "sudo failed running /sbin/cryptsetup status ${luks_volume_name}."
+    else
+        if [ -z "${passphrase_ref2}" ]; then
+            text1="<b>We are going to open the LUKS encrypted filesystem on\n${container_file}.\n\n"
+            text2='The next dialog will ask for its LUKS volume passphrase.\n'
+            text3='Do you want to have the passphrase hidden or shown as you type?</b>'
+            luks_passphrase "${text1}${text2}${text3}" passphrase_ref2
+            if [ "${passphrase_ref2}" = '' ]; then
+                fatal "No passphrase was given. Exiting."
+            fi
+        fi
+
+        log_info "Mapping containder file ${container_file} to /dev/mapper/${luks_volume_name}."
+        output=$( /bin/echo -En "${passphrase_ref2}" | /usr/bin/sudo /sbin/cryptsetup open "${container_file}" "${luks_volume_name}" --key-file=- 2>&1 )
+        exit_code="$?"
+        if [ "${exit_code}" = '0' ]; then
+            log_info "Successfully opened the LUKS volume as /dev/mapper/${luks_volume_name}."
+        elif [ "${exit_code}" = '1' ]; then
+            fatal "sudo failed running cryptsetup open ${container_file} ${luks_volume_name}."
+        else
+            text1="Failed mapping ${container_file} to a mapper device; ${output}\n"
+            local pass_error='No key available with this passphrase.'
+            if [ "${output}" = "${pass_error}" ]; then
+                text2="This error message means the passphrase was wrong.\n"
+                fatal "${text1}${text2}"
+            else
+                fatal "${text1}"
+            fi
+        fi
+        # on success "${container_file}" will be mapped to /dev/mapper/"${luks_volume_name}"
+    fi
+}
+
+luks_mkfs() {
+    local luks_volume_name="$1"
+    # Function:
+    # Create the ext2 filesystem on the LUKS volume "${luks_volume_name}".
+    # Close the LUKS volume in case of an error.
+    # Assumption:
+    # The LUKS volume is already opened.
+
+    log_info "Checking existence of ext2 filesystem on /dev/mapper/${luks_volume_name}."
+    /usr/bin/sudo /sbin/e2fsck -n /dev/mapper/"${luks_volume_name}" > /dev/null 2>&1
+    local exit_code="$?"
+    if [ "${exit_code}" = '0' ]; then
+        # we don't want to destroy the existing filesystem.
+        log_info "/dev/mapper/${luks_volume_name} has already ext2 filesystem on it, so doing nothing."
+    elif [ "${exit_code}" = '1' ]; then
+        luks_close "${luks_volume_name}"
+        fatal "sudo failed running /sbin/e2fsck -n /dev/mapper/${luks_volume_name}."
+    else
+        log_info "Creating an ext2 filesystem on /dev/mapper/${luks_volume_name}."
+        local output
+        output=$( /usr/bin/sudo /sbin/mkfs.ext2 /dev/mapper/"${luks_volume_name}" 2>&1)
+        if [ "$?" = '0' ]; then
+            log_info "Successfully created ext2 filesystem on /dev/mapper/${luks_volume_name}."
+        else
+            luks_close "${luks_volume_name}"
+            fatal "Failed creating a filesystem on /dev/mapper/${luks_volume_name}; ${output}"
+        fi
+    fi
+}
+
+luks_mount() {
+    local luks_volume_name="$1"
+    local luks_mount_point="$2"
+    # Function:
+    # Mount the LUKS volume ${luks_volume_name} at ${luks_mount_point}
+
+    log_info "Checking mount status of /dev/mapper/${luks_volume_name}."
+    if /bin/mountpoint -q "${luks_mount_point}"; then
+        log_info "${luks_mount_point} is already mounted on."
+    else
+        log_info "Mounting /dev/mapper/${luks_volume_name}."
+        local output
+        output=$( /usr/bin/sudo /bin/mount /dev/mapper/"${luks_volume_name}" "${luks_mount_point}" 2>&1)
+        if [ "$?" = '0' ]; then
+            log_info "Successfully mounted /dev/mapper/${luks_volume_name} at ${luks_mount_point}."
+        else
+            log_error "Failed mounting /dev/mapper/${luks_volume_name}; ${output}"
+            luks_close "${luks_volume_name}"
+            fatal "Failed mounting the filesystem at ${luks_mount_point}"
+        fi
+    fi
+}
+
+luks_create_top_dir() {
+    local luks_mount_point="$1"
+    local top_dir="$2"
+    local luks_volume_name="$3"
+    # Function:
+    # Create a top level directory ${top_dir} in the directory ${luks_mount_point}
+
+    local output
+    if [ -d "${luks_mount_point}/${top_dir}" ]; then
+        log_info "The top level directory ${top_dir} under the mount point ${luks_mount_point} already exists."
+    else
+        log_info "Creating the top level directory ${top_dir} under the mount point ${luks_mount_point}."
+        output=$( /usr/bin/sudo /bin/mkdir -p "${luks_mount_point}/${top_dir}" 2>&1)
+        if [ "$?" != '0' ]; then
+            log_error "Failed mkdir ${luks_mount_point}/${top_dir}; ${output}"
+            info "Failed mkdir ${luks_mount_point}/${top_dir}"
+        fi
+    fi
+
+    local owner=$(/usr/bin/stat --format='%U' "${luks_mount_point}/${top_dir}")
+    if [ "${owner}" = "${ACCOUNT}" ]; then
+        log_info "The owner of the top level directory ${top_dir} is already ${ACCOUNT}."
+    else
+        log_info "Changing the owner of the top level directory ${top_dir} to ${ACCOUNT}."
+        output=$( /usr/bin/sudo /bin/chown "${ACCOUNT}" "${luks_mount_point}/${top_dir}" )
+        if [ "$?" != '0' ]; then
+            log_error "Failed chown ${ACCOUNT} ${luks_mount_point}/${top_dir}; ${output}"
+            info "Failed mkdir ${luks_mount_point}/${top_dir}"
+        fi
+    fi
+}
+
+luks_umount() {
+    local luks_mount_point="$1"
+    # Function:
+    # Un-mount the LUKS volume ${luks_volume_name} at ${luks_mount_point}
+
+    log_info "Unmounting the file system on ${luks_mount_point}."
+    local output
+    output=$( /usr/bin/sudo /bin/umount ${luks_mount_point} 2>&1)
+    if [ "$?" = '0' ]; then
+        log_info "Successfully unmounted ${luks_mount_point}."
+    else
+        log_error "Failed unmounting the filesystem on ${luks_mount_point}; ${output}"
+        local text1="Failed unmounting the filesystem on ${luks_mount_point}.\n"
+        local text2="Please note LUKS filesystem was not closed automatically."
+        fatal "${text1}${text2}"
+    fi
+}
+
+luks_close() {
+    local luks_volume_name="$1"
+    # Function:
+    # Close the LUKS volume "${luks_volume_name}" on the LUKS container file.
+
+    log_info 'Closing the LUKS device.'
+    local output
+    output=$( /usr/bin/sudo /sbin/cryptsetup close "${luks_volume_name}" 2>&1)
+    local exit_code="$?"
+    if [ "${exit_code}" = '0' ]; then
+        log_info 'Successfully closed the LUKS device.'
+    elif [ "${exit_code}" = '1' ]; then
+        fatal "sudo failed running cryptsetup close ${luks_volume_name}."
+    else
+        log_error "sudo /sbin/cryptsetup close ${luks_volume_name} returned ${exit_code}"
+        fatal "Failed closing the LUKS device; ${output}."
+    fi
+}
+
+luks_passphrase_double_check() {
+    local ui_text="$1"
+    local -n passphrase_ref1="$2"  # nameref of the variable used in the caller.
+    # Function:
+    # Present a dialog for a new passphrase.
+    # The user can cancel the dialog to stop the whole process.
+    #
+    # Restriction:
+    # The following control characters are not allowed as part of a passphrase:
+    #   Null, Control-J (LF) and Control-K (VT).
+    # Control-K is used as the field separator for yad.
+    # Control-J is interpreted to separate input into lines by sed and cut.
+    #
+
+    log_info "Prompting the user for a new LUKS passphrase."
+
+    local passphrase_title='LUKS Volume Encrytion Passphrase'
+
+    /usr/bin/yad \
+        --title "${passphrase_title}" \
+        --text "${ui_text}" \
+        --button='Hide:0' --button='Show:1' --no-escape \
+        --image 'dialog-question' --window-icon='dialog-question' \
+        --center --fixed --borders=12
+    local hide="$?"
+
+    local done_pp='no'
+    local field1 field2 passphrase1 passphrase2 text
+    local status
+    local yad_field_sep=$'\v'
+    local num_newlines sep_chars
+
+    while [ "${done_pp}" != 'yes' ]
+    do
+        if [ "${hide}" = '0' ]; then
+            field1='passphrase:H'
+            field2='passphrase (verify):H'
+            text='<b>Enter your LUKS volume passphrase.\nEntered passphrase is masked.\nTo exit script press Cancel.</b>'
+        else
+            field1='passphrase'
+            field2='passphrase (verify)'
+            text='<b>Enter your LUKS volume passphrase.\nTo exit script press Cancel.</b>'
+        fi
+
+        # override yad default field separator '|' by control-k which would not appear in passphrase.
+        form_output=$(/usr/bin/yad \
+                          --form \
+                          --field "${field1}" \
+                          --field "${field2}" \
+                          --separator="${yad_field_sep}" \
+                          --no-escape \
+                          --title "${passphrase_title}" \
+                          --text "${text}" \
+                          --image 'dialog-question' --window-icon 'dialog-question' \
+                          --on-top --center --fixed --borders 12 )
+        status="$?"
+
+        if [ "${status}" != '0' ]; then  # cancelled
+            done_pp='yes'
+            log_info "Passphrase dialog cancelled."
+        else
+            num_newlines=$(/bin/echo -En "${form_output}" | /usr/bin/wc --lines)
+            if [ "${num_newlines}" != 0 ]; then
+                log_info "Control-J detected within a passphrase."
+                /usr/bin/yad \
+                    --title "${passphrase_title}" \
+                    --text "<b>Control-J chatacter is not allowed within a passphrase.\nPress OK to try it again.</b>" \
+                    --button 'OK:0' --no-escape \
+                    --image 'dialog-warning' --window-icon 'dialog-warning' \
+                    --center --borders 12 --fixed
+            else
+                sep_chars=$(/bin/echo -En "${form_output}" | /bin/sed -e 's/[^\v]//g' | /usr/bin/wc --chars)
+                if [ "${sep_chars}" != 2 ]; then
+                    log_info "Control-K detected within a passphrase."
+                    /usr/bin/yad \
+                        --title "${passphrase_title}" \
+                        --text "<b>Control-K chatacter is not allowed within a passphrase.\nPress OK to try it again.</b>" \
+                        --button 'OK:0' --no-escape \
+                        --image 'dialog-warning' --window-icon 'dialog-warning' \
+                        --center --borders 12 --fixed
+                else
+                    passphrase1=$(/bin/echo -En "${form_output}" | /usr/bin/cut -d $'\v' -f 1)
+                    passphrase2=$(/bin/echo -En "${form_output}" | /usr/bin/cut -d $'\v' -f 2)
+                    if [ "${passphrase1}" = "${passphrase2}" ]; then
+                        done_pp='yes'
+                        log_info "Two entered passphrases matched."
+                        passphrase_ref1="${passphrase1}"
+                    else
+                        log_info "Error: Two entered passphrases didn't match."
+                        /usr/bin/yad \
+                            --title "${passphrase_title}" \
+                            --text "<b>Given passphrases didn't match.\nPress OK to try it again.</b>" \
+                            --button 'OK:0' --no-escape \
+                            --image 'dialog-warning' --window-icon 'dialog-warning' \
+                            --center --borders 12 --fixed
+                    fi
+                fi
+            fi
+        fi
+    done
+}
+
+luks_passphrase() {
+    local ui_text="$1"
+    local -n passphrase_ref3="$2"  # nameref of the variable used in the caller.
+    # Function:
+    # Present a dialog for an existing passphrase.
+
+    log_info "Prompting the user for the LUKS passphrase."
+    local passphrase_title='LUKS Volume Encrytion Passphrase'
+
+    /usr/bin/yad \
+        --title "${passphrase_title}" \
+        --text "${ui_text}" \
+        --button='Hide:0' --button='Show:1' --no-escape \
+        --image 'dialog-question' --window-icon='dialog-question' \
+        --center --fixed --borders=12
+    local hide="$?"
+
+    local field
+    local text
+    if [ "${hide}" = '0' ]; then
+        field='passphrase:H'
+        text='<b>Enter your LUKS volume passphrase.\nEntered passphrase is masked.\nTo exit script press Cancel.</b>'
+    else
+        field='passphrase'
+        text='<b>Enter your LUKS volume passphrase.\nTo exit script press Cancel.</b>'
+    fi
+
+    # instead of yad default field separator '|' use control-k which should not appear in a passphrase.
+    local yad_field_sep=$'\v'
+    form_output=$(/usr/bin/yad \
+                      --form \
+                      --field "${field}" \
+                      --separator="${yad_field_sep}" \
+                      --no-escape \
+                      --title "${passphrase_title}" \
+                      --text "${text}" \
+                      --image 'dialog-question' --window-icon 'dialog-question' \
+                      --center --on-top --fixed --borders 12)
+    passphrase_ref3=$(/bin/echo -En "${form_output}" | /bin/sed -e 's/\v.*//')
+}
+
+luks_passphrase_old_new() {
+    local ui_text="$1"
+    local -n passphrase_old_ref="$2"  # nameref of the variable used in the caller.
+    local -n passphrase_new_ref="$3"  # nameref of the variable used in the caller.
+    # Function:
+    # Present a dialog for a new passphrase that replaces an existing passphrase.
+    # The user can cancel the dialog to stop the whole process.
+    #
+    # Restriction:
+    # The following control characters are not allowed as part of passphrases:
+    #   Null, Control-J (LF) and Control-K (VT).
+    # Control-K is used as the field separator for yad.
+    # Control-J is interpreted to separate input into lines by sed and cut.
+    #
+
+    log_info "Prompting the user for the existing and a new LUKS passphrase."
+
+    local passphrase_title='LUKS Volume Encrytion Passphrase Update'
+
+    /usr/bin/yad \
+        --title "${passphrase_title}" \
+        --text "${ui_text}" \
+        --button='Hide:0' --button='Show:1' --no-escape \
+        --image 'dialog-question' --window-icon='dialog-question' \
+        --center --fixed --borders=12
+    local hide="$?"
+
+    local done_pp='no'
+    local field_a field_b field_c text passphrase_old passphrase_new1 passphrase_new2
+    local status
+    local yad_field_sep=$'\v'
+    local num_newlines sep_chars
+
+    while [ "${done_pp}" != 'yes' ]
+    do
+        if [ "${hide}" = '0' ]; then
+            field_a='old passphrase:H'
+            field_b='new passphrase:H'
+            field_c='new passphrase (verify):H'
+            text='<b>Enter an existing LUKS volume passphrase and a new passphrase.\nEntered passphrase is masked.\nTo exit script press Cancel.</b>'
+        else
+            field_a='old passphrase'
+            field_b='new passphrase'
+            field_c='new passphrase (verify)'
+            text='<b>Enter an existing LUKS volume passphrase and a new passphrase.\nTo exit script press Cancel.</b>'
+        fi
+
+        # override yad default field separator '|' by control-k which would not appear in passphrase.
+        form_output=$(/usr/bin/yad \
+                          --form \
+                          --field "${field_a}" \
+                          --field "${field_b}" \
+                          --field "${field_c}" \
+                          --separator="${yad_field_sep}" \
+                          --no-escape \
+                          --title "${passphrase_title}" \
+                          --text "${text}" \
+                          --image 'dialog-question' --window-icon 'dialog-question' \
+                          --on-top --center --fixed --borders 12 )
+        status="$?"
+
+        if [ "${status}" != '0' ]; then  # cancelled
+            done_pp='yes'
+            log_info "Passphrase dialog cancelled."
+        else
+            num_newlines=$(/bin/echo -En "${form_output}" | /usr/bin/wc --lines)
+            if [ "${num_newlines}" != 0 ]; then
+                log_info "Control-J detected within a passphrase."
+                /usr/bin/yad \
+                    --title "${passphrase_title}" \
+                    --text "<b>Control-J chatacter is not allowed within a passphrase.\nPress OK to try it again.</b>" \
+                    --button 'OK:0' --no-escape \
+                    --image 'dialog-warning' --window-icon 'dialog-warning' \
+                    --center --borders 12 --fixed
+            else
+                sep_chars=$(/bin/echo -En "${form_output}" | /bin/sed -e 's/[^\v]//g' | /usr/bin/wc --chars)
+                if [ "${sep_chars}" != 3 ]; then
+                    log_info "Control-K detected within a passphrase."
+                    /usr/bin/yad \
+                        --title "${passphrase_title}" \
+                        --text "<b>Control-K chatacter is not allowed within a passphrase.\nPress OK to try it again.</b>" \
+                        --button 'OK:0' --no-escape \
+                        --image 'dialog-warning' --window-icon 'dialog-warning' \
+                        --center --borders 12 --fixed
+                else
+                    passphrase_old=$(/bin/echo -En "${form_output}" | /usr/bin/cut -d $'\v' -f 1)
+                    passphrase_new1=$(/bin/echo -En "${form_output}" | /usr/bin/cut -d $'\v' -f 2)
+                    passphrase_new2=$(/bin/echo -En "${form_output}" | /usr/bin/cut -d $'\v' -f 3)
+                    if [ "${passphrase_new1}" != "${passphrase_new2}" ]; then
+                        log_info "Error: two entered passphrases didn't match."
+                        /usr/bin/yad \
+                            --title "${passphrase_title}" \
+                            --text "<b>Two new passphrases didn't match.\nPress OK to try it again.</b>" \
+                            --button 'OK:0' --no-escape \
+                            --image 'dialog-warning' --window-icon 'dialog-warning' \
+                            --center --borders 12 --fixed
+                    elif [ "${passphrase_old}" = "${passphrase_new1}" ]; then
+                        log_info "Error: the existing and the new passphrases are the same."
+                        /usr/bin/yad \
+                            --title "${passphrase_title}" \
+                            --text "<b>The existing and the new passphrases are the same.\nPress OK to try it again.</b>" \
+                            --button 'OK:0' --no-escape \
+                            --image 'dialog-warning' --window-icon 'dialog-warning' \
+                            --center --borders 12 --fixed
+                    else
+                        done_pp='yes'
+                        log_info "Two existing passphrases matched."
+                        passphrase_old_ref="${passphrase_old}"
+                        passphrase_new_ref="${passphrase_new1}"
+                    fi
+                fi
+            fi
+        fi
+    done
+}
+
+save_metadata_new_wallets() {
+    local -n wallets_before_ref="$1"  # nameref of the variable used in the caller.
+    local -n wallets_after_ref="$2"  # nameref of the variable used in the caller.
+    local wallet_metadata_dir="$3"
+    # Function:
+    # Save wallet metadata in the metadata directory within the LUKS volume.
+    # This function is meant to be called from electrum-offline-wrapper
+
+    set_pinentry_timeout
+
+    local wallets_before_extra=()
+    local wallets_after_extra=()
+    diff_two_arrays wallets_before_ref wallets_after_ref wallets_before_extra wallets_after_extra
+
+    local text1
+    local text2
+    if [ ${#wallets_after_extra[@]} = 0 ]; then
+        log_info "Found no new wallets."
+    else
+        log_info "Found new wallet(s): ${wallets_after_extra[@]}."
+
+        if [ ${#wallets_after_extra[@]} = 1 ]; then
+            text1='<b>A new wallet was found: </b>'
+            text2='\n<b>The next dialog will let you save its metadata in an encrypted files.</b>\n'
+        elif [ ${#wallets_after_extra[@]} -gt 1 ]; then
+            text1='<b>Some new wallets were found: </b>'
+            text2='\n<b>The next dialogs will let you save their metadata in encrypted files.</b>\n'
+        fi
+        local text3='\n<b>(*) Along with saving seeds and metadata in an encrypted form in electronic devices\n'
+        local text4='it would be a good idea to write them on paper to avoid the loss due to device failures.\n</b>'
+        local new_wallets_list=''
+        local wallet_file
+        for wallet_file in "${wallets_after_extra[@]}"; do
+            new_wallets_list="${new_wallets_list}\n\t${wallet_file}"
+        done
+
+        log_info "Inquiring of saving metadata for new wallet(s)."
+        /usr/bin/yad \
+            --title "Save Metadata" \
+            --text "${text1}${new_wallets_list}${text2}${text3}${text4}" \
+            --image 'dialog-information' --window-icon='dialog-information' \
+            --no-escape \
+            --fixed --borders=12
+        local status="$?"
+        if [ "${status}" != '0' ]; then
+            info "User canceled saving metadata."
+        else
+            for wallet_file in "${wallets_after_extra[@]}"; do
+                do_save_metadata "${wallet_file}" "${wallet_metadata_dir}"
+            done
+        fi
+    fi
+
+    text1="<b>We are ready to close the encrypted filesystem.</b>\n"
+    text2="<b>Press OK to un-mount and close the LUKS volume ${LUKS_WALLET_MOUNT_POINT}.</b>"
+    /usr/bin/yad --image dialog-information --window-icon dialog-information \
+                 --button OK:0 --no-escape \
+                 --title "$0" --text "${text1}${text2}" --borders=12 --fixed
+}
+
+save_metadata() {
+    local wallet_dir="$1"
+    local wallet_metadata_dir="$2"
+
+    set_pinentry_timeout
+
+    local text=''
+    local text_ext='<b>Do you have another wallet to save the metadata?</b>\n\n'
+    local wallet_file
+    while [ 1 ]; do
+        select_wallet "${wallet_dir}" wallet_file "${text}"
+        if [ -z "${wallet_file}" ]; then
+            break
+        fi
+        do_save_metadata "${wallet_file}" "${wallet_metadata_dir}"
+        text="${text_ext}"
+    done
+}
+
+select_wallet() {
+    local wallet_dir="$1"
+    local -n wallet_file_ref="$2"  # nameref of the variable used in the caller.
+    local text0="$3"
+
+    # dialog to select a source Electrum wallet
+    log_info "Inquiring to select a wallet file in directory ${wallet_dir}."
+
+    local wallet_path_temp="${wallet_dir}/YOUR-WALLET-FILE"
+    local text1='<b>Select the Electrum wallet file to save its metadata.\n'
+    local text2='Later the metadata will be encrypted via GnuPG command.\n'
+    local text3='To quit press Cancel.\n</b>'
+    local dialog_output=$(
+        /usr/bin/yad \
+            --file \
+            --filename="${wallet_path_temp}" \
+            --title "Save Wallet Metadata" \
+            --text "${text0}${text1}${text2}${text3}" \
+            --image 'dialog-question' --window-icon='dialog-question' \
+            --borders=12 --fixed --no-escape)
+    if [ -z "${dialog_output}" ]; then
+        info 'No file was selected. Exiting.'
+        wallet_file_ref=''
+        return
+    fi
+    local wallet_path="${dialog_output}"
+    wallet_file_ref=$(/usr/bin/basename "${wallet_path}")
+    log_info "User selected the wallet file: ${wallet_path}."
+}
+
+do_save_metadata() {
+    local wallet_file="$1"
+    local wallet_metadata_dir="$2"
+
+    local today=$(/bin/date '+%m/%d/%Y %H:%M %Z')
+    local text1 text2 text3 text4 text5 text6 text7 text8 dialog_output output
+
+    text1='<b>Metadata for wallet: '
+    text2='</b>'
+
+    local electrum_installed_version
+    find_installed_electrum "${ELECTRUM_DIR}" electrum_installed_version
+    if [ -z "${electrum_installed_version}" ]; then
+        # this should not happen because we should have already checked this in electrum-offline-wrapper
+        info "error: can't find a unique Electrum installation under ${ELECTRUM_DIR}"
+        return
+    fi
+
+    log_info "Inquiring of metadata for the wallet file: ${wallet_file}."
+    local yad_field_sep=$'\v'
+    dialog_output=$(
+        /usr/bin/yad \
+            --form \
+            --title "Save Metadata for ${wallet_file}" \
+            --text "${text1}${wallet_file}${text2}" \
+            --field 'Electrum version:' "${electrum_installed_version}" \
+            --field 'Wallet file name:' "${wallet_file}" \
+            --field 'Wallet-type::CB' 'standard!two-factor authentication!multi-signature!import' \
+            --field 'Seed type::CB' 'standard!segwit' \
+            --field 'Seed phrase:' 'YOUR SEED PHRASE HERE' \
+            --field 'Seed extension custom words:' '' \
+            --field 'BIP39 seed::CB' 'No!Yes' \
+            --field 'Script type::CB' 'legacy (p2pkh)!p2sh-segwit (p2wpkh-p2sh)!native segwit (p2wpkh)' \
+            --field 'Derivation path:' 'ONLY IF YOU CUSTOMIZED IT' \
+            --field 'Creation time:' "${today}" \
+            --separator="${yad_field_sep}" \
+            --image 'dialog-question' --window-icon='dialog-question' \
+            --no-escape \
+            --width=550 --borders=12)
+    if [ -z "${dialog_output}" ]; then
+        info "Cancelling saving metadata for ${wallet_file}."
+        return
+    fi
+
+    electrum_version=$(/bin/echo -E "${dialog_output}" | /usr/bin/cut -d $'\v' -f 1)
+    local file_name=$(/bin/echo -E "${dialog_output}" | /usr/bin/cut -d $'\v' -f 2)
+    local wallet_type=$(/bin/echo -E "${dialog_output}" | /usr/bin/cut -d $'\v' -f 3)
+    local seed_type=$(/bin/echo -E "${dialog_output}" | /usr/bin/cut -d $'\v' -f 4)
+    local seed_phrase=$(/bin/echo -E "${dialog_output}" | /usr/bin/cut -d $'\v' -f 5)
+    local custom_words=$(/bin/echo -E "${dialog_output}" | /usr/bin/cut -d $'\v' -f 6)
+    local bip39=$(/bin/echo -E "${dialog_output}" | /usr/bin/cut -d $'\v' -f 7)
+    local script_type=$(/bin/echo -E "${dialog_output}" | /usr/bin/cut -d $'\v' -f 8)
+    local derivation_path=$(/bin/echo -E "${dialog_output}" | /usr/bin/cut -d $'\v' -f 9)
+    local created_time=$(/bin/echo -E "${dialog_output}" | /usr/bin/cut -d $'\v' -f 10)
+
+    local wallet_metadata_temp_path="${wallet_metadata_dir}/${wallet_file}_metadata.gpg"
+
+    log_info "Inquiring of metadata file path for the wallet file: ${wallet_file}."
+    dialog_output=$(/usr/bin/yad \
+                        --file --save \
+                        --title "Save Metadata for ${wallet_file}" \
+                        --filename="${wallet_metadata_temp_path}" \
+                        --text '<b>GnuPG File to save the wallet metadata:</b>' \
+                        --confirm-overwrite 'Really OK to overwrite the already existing file?' \
+                        --image 'dialog-question' --window-icon='dialog-question' \
+                        --borders=12 --fixed --no-escape)
+    if [ -z "${dialog_output}" ]; then
+        info "Cancelling saving metadata for ${wallet_file}."
+        return
+    fi
+    local wallet_metadata_path="${dialog_output}"
+
+    text1='<b>Going to encrypt the wallet metadata with GPG symmetric cipher and write it\n'
+    text2="in the file ${wallet_metadata_path}\n"
+    text3='within the LUKS volume.\n\n'
+    text4='(1) GPG will ask for your new passphrase in the next dialog.\n'
+    text5="(2) <span foreground='blue'>The GPG passphrase dialog will timeout in ${PINENTRY_TIMEOUT} seconds.</span>\n"
+    text6='    If you need more time to decide your GPG passphrase you can cancel this now and\n'
+    text7='    later run the script save-wallet-metadata to write the metadata in a GPG encrypted file.\n'
+    text8='(3) <span foreground="blue">Please remember to keep your GPG passphrase in multiple safe places!</span></b>\n'
+
+    /usr/bin/yad \
+        --image dialog-information --window-icon dialog-information \
+        --button Cancel:1 --button OK:0 --no-escape \
+        --title "Save Metadata for ${wallet_file}" \
+        --text "${text1}${text2}${text3}${text4}${text5}${text6}${text7}${text8}" \
+        --borders=12 --fixed
+    local status="$?"
+    if [ "${status}" = '1' ]; then
+        info "Cancelling saving metadata for ${wallet_file}."
+        return
+    fi
+
+    local NEWLINE=$'\n'
+    local header_line="Wallet Metadata${NEWLINE}${NEWLINE}"
+    local version_line="Electrum version: ${electrum_version}${NEWLINE}"
+    local file_line="Wallet file name: ${file_name}${NEWLINE}"
+    local wallet_line="Wallet type: ${wallet_type}${NEWLINE}"
+    local seed_t_line="Seed type: ${seed_type}${NEWLINE}"
+    local seed_line="Seed phrase: ${seed_phrase}${NEWLINE}"
+    local custom_line="Seed extension custom words: ${custom_words}${NEWLINE}"
+    local bip39_line="BIP39: ${bip39}${NEWLINE}"
+    local script_type_line="Script type: ${script_type}${NEWLINE}"
+    local derivation_path_line="Derivation path: ${derivation_path}${NEWLINE}"
+    local created_line="Creation date: ${created_time}${NEWLINE}"
+    local metadata_content="${header_line}${version_line}${file_line}${wallet_line}${seed_t_line}${seed_line}${custom_line}${bip39_line}${script_type_line}${derivation_path_line}${created_line}"
+
+    log_info "GPG encrypting metadata file: ${wallet_metadata_path}."
+
+    # GPG will open a pinentry dialog for its passphrase
+    output=$(/bin/echo -En "${metadata_content}" \
+                 | /usr/bin/gpg --symmetric --output "${wallet_metadata_path}" 2>&1)
+    status="$?"
+    if [ "${status}" != '0' ]; then
+        log_info "GPG command failed for ${wallet_metadata_path}; ${output}"
+        return
+    fi
+}
+
+set_pinentry_timeout() {
+    local gpg_agent_conf="${HOME}/.gnupg/gpg-agent.conf"
+    local new_gpg_agent_conf=$(/bin/mktemp)
+
+    local timeout_line_pattern='[ ]*pinentry-timeout[ ]+[0-9]+( .*|$)?'
+    # sed command to comment out the line matching the pattern ^${timeout_line_pattern} and add a new config line:
+    # pinentry-timeout ${PINENTRY_TIMEOUT}
+    local sed_command="s/(^${timeout_line_pattern})/##\1/;/^##${timeout_line_pattern}/a pinentry-timeout ${PINENTRY_TIMEOUT}"
+
+    local output status
+    output=$( /bin/sed \
+                  -E \
+                  -e "${sed_command}" \
+                  "${gpg_agent_conf}" 2>&1 > ${new_gpg_agent_conf} )
+    status="$?"
+    if [ "${status}" != 0 ]; then
+        log_error "error: sed failed; ${output}"
+        return
+    fi
+
+    log_info "changing pinentry-timeout in ${gpg_agent_conf} to ${PINENTRY_TIMEOUT}"
+    output=$( /bin/mv --force "${new_gpg_agent_conf}" "${gpg_agent_conf}" )
+    status="$?"
+    if [ "${status}" != 0 ]; then
+        log_error "error: mv ${new_gpg_agent_conf} ${gpg_agent_conf}; ${output}"
+        return
+    fi
+
+    # find current processes of gpg-agent
+    output=($(/usr/bin/pgrep --full 'gpg-agent'))
+    local pid
+    for pid in "${output[@]}"; do
+        log_info "sending SIGHUP to the gpg-agent process ${pid}"
+        /bin/kill -SIGHUP "${pid}"
+    done
+}
+
+
+setup_logging_coproc() {
+    local title=$1
+    # Function:
+    # Create a receiving coproc to display logging messages.
+
+    coproc /usr/bin/yad \
+           --text-info \
+           --tail --listen \
+           --title="$title" \
+           --button=Exit:0 --no-escape \
+           --geometry=740x200+0+100 --show-cursor \
+           --image=dialog-information --window-icon=dialog-information
+    /bin/sleep 0.1
+}
+
+log_info() {
+    local args=("$@")
+    if [ "${#COPROC[@]}" = 2 ]; then
+        /bin/echo -E "[info $(/bin/date)] ${args[@]}" >&${COPROC[1]}
+    fi
+}
+
+log_error() {
+    local args=("$@")
+    if [ "${#COPROC[@]}" = 2 ]; then
+        /bin/echo -E "[error $(/bin/date)] ${args[@]}" >&${COPROC[1]}
+    fi
+}
+
+fatal() {
+    local args=("$@")
+    if [ "${#COPROC[@]}" = 2 ]; then
+        /bin/echo -E "[fatal $(/bin/date)] ${args[@]}" >&${COPROC[1]}
+    fi
+
+    /usr/bin/yad \
+        --title "$0" \
+        --text "<b>${args[@]}</b>\n=====================================" \
+        --button OK:0 --no-escape \
+        --image dialog-error --window-icon dialog-error \
+        --on-top --center --borders=12 --width=500
+    # a long string of = character here is used to work around a seeming bug of yad giving excessive height to dialog windows.
+
+    if [ "${#COPROC[@]}" = 2 ]; then
+        /bin/echo "*** Close this dialog to exit the script. ***" >&${COPROC[1]}
+    fi
+    wait_coproc
+    exit 1
+}
+
+info() {
+    local args=("$@")
+    if [ "${#COPROC[@]}" = 2 ]; then
+        /bin/echo -E "[info $(/bin/date)] ${args[@]}" >&${COPROC[1]}
+    fi
+
+    /usr/bin/yad \
+        --title "$0" \
+        --text "<b>${args[@]}</b>\n=====================================" \
+        --button OK:0 --no-escape \
+        --image dialog-information --window-icon dialog-information \
+        --on-top --center --borders=12 --width=500
+}
+
+allsteps_done() {
+    local logging_window=$1
+
+    local text1="<b>The script finished with no errors.</b>\n"
+    local text2="<b>To exit the script press exit in the window \"${logging_window}\".</b>\n\n"
+    local text3="Note:\n"
+    local text4="The text within the logging window was not saved in any file.\n"
+    local text5="Please remember all files under the Live system are on the RAM drive and so\n"
+    local text6="they will not persist after logout unless written to media external to the Live system.\n"
+
+    /usr/bin/yad \
+        --title "$0" \
+        --text "${text1}${text2}${text3}${text4}${text5}${text6}" \
+        --button OK:0 --no-escape \
+        --image dialog-information --window-icon dialog-information \
+        --on-top --fixed --borders=12 --center
+}
+
+wait_coproc() {
+    wait ${COPROC_PID}
+}
+
+dir_files() {
+    local dir_path="$1"
+    local -n array_ref="$2"  # nameref of the variable used in the caller.
+    local files
+
+    mapfile -t files < <( /usr/bin/find "${dir_path}" -type f -exec /usr/bin/basename '{}' ';' | /usr/bin/sort )
+
+    local entry
+    for entry in "${files[@]}"; do
+        if [ "${entry}" != '.' ] && [ "${entry}" != '..' ]; then
+            array_ref+=("${entry}")
+        fi
+    done
+}
+
+diff_two_arrays() {
+    local -n array_ref_1="$1"  # nameref of the variable used in the caller.
+    local -n array_ref_2="$2"  # nameref of the variable used in the caller.
+    local -n array_1_extra_ref="$3"  # nameref of the variable used in the caller.
+    local -n array_2_extra_ref="$4"  # nameref of the variable used in the caller.
+
+    local ii=0
+    local jj=0
+    while [ $ii -lt ${#array_ref_1[@]} ] && [ $jj -lt ${#array_ref_2[@]} ]; do
+        if [ "${array_ref_1[$ii]}" = "${array_ref_2[$jj]}" ]; then
+            ii=$(($ii + 1))
+            jj=$(($jj + 1))
+        elif [ "${array_ref_1[$ii]}" \< "${array_ref_2[$jj]}" ]; then
+            array_1_extra_ref+=("${array_ref_1[$ii]}")
+            ii=$(($ii + 1))
+        elif [ "${array_ref_1[$ii]}" \> "${array_ref_2[$jj]}" ]; then
+            array_2_extra_ref+=("${array_ref_2[$jj]}")
+            jj=$(($jj + 1))
+        fi
+    done
+
+    while [ $ii -lt ${#array_ref_1[@]} ]; do
+        array_1_extra_ref+=("${array_ref_1[$ii]}")
+        ii=$(($ii + 1))
+    done
+    while [ $jj -lt ${#array_ref_2[@]} ]; do
+        array_2_extra_ref+=("${array_ref_2[$jj]}")
+        jj=$(($jj + 1))
+    done
+}
+
+# end

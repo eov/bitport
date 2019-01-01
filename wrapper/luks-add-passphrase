@@ -1,0 +1,117 @@
+#!/bin/bash
+# -*- mode: sh; coding: utf-8; -*-
+
+# Script
+#   luks-add-passphrase
+#
+# Assumption
+# - The script luks-setup-wallet-dir was already run to set up the LUKS encrypted volume for wallet on the USB flash drive.
+# - The wallet data filesystem (with the label ${WALLET_MEDIA_VOLUME_LABEL}) on the USB flash drive is already mounted.
+#
+# Function
+# - Make sure another instance of our scripts are not currently running.
+# - Check if the wallet data filesystem of the USB drive is mounted at the prescribed location.
+# - Add a new passphrase for the LUKS volume within the container file ${WALLET_CONTAINER_FILE}.
+#
+# Restriction
+# - The following characters are not allowed within the passphrase dialog:
+#     Null, Control-J (LF) and Control-K (VT).
+#   Control-K is used as the custom field separator for yad.
+#   Control-J is interpreted as the input record separator by sed and cut.
+# - Other control characters are allowed as well as normal printable characters including ASCII and Unicode.
+#   However cryptsetup document recommends 7-bit ASCII characters for passphrases,
+#   so the use of control characters within passphrases should be for advanced users only.
+#
+# Logging
+# - Logging information will be displayed in one of the yad window for inspection purpose,
+#   but will not be saved in any files.
+#
+
+script_path=$(realpath "$0")
+script_dir=$(dirname "${script_path}")
+
+source "${script_dir}/common-utils"
+
+main() {
+
+    check_electrum
+    check_script_instance "${SCRIPT_LUKS_SETUP_WALLET}"
+    check_script_instance "${SCRIPT_SAVE_WALLET_METADATA}"
+    check_script_instance "${SCRIPT_ELECTRUM_WRAPPER}"
+    check_script_instance "${SCRIPT_DISPLAY_WALLET_METADATA}"
+    check_script_instance "${SCRIPT_LUKS_CHANGE_PASSPHRASE}"
+    check_script_instance "${SCRIPT_LUKS_ADD_PASSPHRASE}"
+
+    local logging_window="Add passphrase for LUKS encrypted volume logging"
+    local container_file_path="${WALLET_MEDIA_MOUNT_POINT}/${WALLET_CONTAINER_FILE}"
+
+    setup_logging_coproc "${logging_window}"
+
+    check_media_mount "${WALLET_MEDIA_MOUNT_POINT}"
+
+    load_dm_crypt
+
+    make_mount_point "${LUKS_WALLET_MOUNT_POINT}"
+
+    luks_add_passphrase "${container_file_path}"
+
+    allsteps_done "${logging_window}"
+
+    wait_coproc
+}
+
+luks_add_passphrase() {
+    local container_file="$1"
+
+    local text1 text2 text3 text4
+    text1="<b>We are going to add a new passphrase for the LUKS volume on\n${container_file}.</b>\n\n"
+    text2='<b>The next dialog will ask for one of the current passphrases and the new passphrase.</b>\n'
+    text3='<b>Do you want to have the passphrases hidden or shown as you type?</b>\n\n'
+    text4='<b>(*) Please remember to keep your passphrase in multiple safe places!</b>\n'
+
+    local old_passphrase new_passphrase
+    luks_passphrase_old_new "${text1}${text2}${text3}${text4}" old_passphrase new_passphrase
+
+    if [ -z "${old_passphrase}" ]; then
+        fatal "Old passphrase was not given. Exiting."
+    fi
+    if [ -z "${new_passphrase}" ]; then
+        fatal "New passphrase was not given. Exiting."
+    fi
+
+    # cryptsetup luksAddKey requires the new passphrase to be supplied as a file argument when run in the batch mode.
+    # it should be safe to store passphrase in a file on RAM drive.
+    local status
+    local new_passphrase_file
+    new_passphrase_file=$(/bin/mktemp)
+    status="$?"
+    if [ "${status}" != '0' ]; then
+        exit 1
+    fi
+    /bin/echo -En "${new_passphrase}" > "${new_passphrase_file}"
+
+    log_info "Adding a new passphrase for the LUKS volume."
+    local output
+    output=$( /bin/echo -En "${old_passphrase}" | /usr/bin/sudo /sbin/cryptsetup luksAddKey "${container_file}" --key-file=- "${new_passphrase_file}" 2>&1 )
+    status="$?"
+
+    /bin/rm "${new_passphrase_file}"
+
+    if [ "${status}" = '0' ]; then
+        log_info "Successfully added the new passphrase for the LUKS volume."
+    elif [ "${status}" = '1' ]; then
+        fatal "sudo failed running cryptsetup luksAddKey ${container_file}."
+    else
+        text1="cryptsetup luksAddKey failed in adding a new passphrase; ${output}\n"
+        local pass_error='No key available with this passphrase.'
+        if [ "${output}" = "${pass_error}" ]; then
+            text2="This error message means the old passphrase was wrong.\n"
+            fatal "${text1}${text2}"
+        else
+            fatal "${text1}"
+        fi
+    fi
+}
+
+
+main

@@ -1,0 +1,121 @@
+#!/bin/bash
+# -*- mode: sh; coding: utf-8; -*-
+
+# Script
+#   electrum-offline-wrapper
+#
+# Assumption
+# - The script luks-setup-wallet-dir was already run to create the LUKS encrypted volume for wallets on the USB flash drive.
+# - The wallet data filesystem (which should have the filesystem label ${WALLET_MEDIA_VOLUME_LABEL}) on the USB flash drive is already mounted.
+#
+# Function
+# - Make sure another instance of our scripts are not currently running,
+# - check if the wallet data filesystem of the USB drive is mounted at the prescribed location,
+# - open and mount the encrypted LUKS volume stored in ${WALLET_CONTAINER_FILE},
+# - check what wallets are stored within Electrum wallets directory,
+# - run run_electrum using ${LUKS_ELECTRUM_DATA_DIR} as the data directory on the LUKS volume,
+# - after exiting Electrum, present a dialog for saving wallet metadata if new wallets were found,
+# - after exiting metadata dialog, unmount and close the encrypted LUKS volume.
+#
+# Note
+# - Electrum will create its wallets within the data directory ${LUKS_ELECTRUM_DATA_DIR}/${ELECTRUM_WALLET_DIR}.
+# - If the user chooses to use the wallet encryption option provided by Electrum,
+#   wallet data will be doubly protected by encryption, first by Electrum encryption and second by LUKS encryption.
+# - Wallet metadata will also be protected by GPG encryption as well as LUKS encryption.
+# - User needs to maintain a) LUKS passphrase, b) Electrum wallet password(s), c) GPG passphrase(s) for metadata.
+#
+# Logging
+# - Logging information will be displayed in one of the yad window for inspection purpose,
+#   but will not be saved in any files.
+#
+
+script_path=$(/usr/bin/realpath "$0")
+script_name=$(/usr/bin/basename "$0")
+script_dir=$(/usr/bin/dirname "${script_path}")
+source "${script_dir}/common-utils"
+
+
+main() {
+
+    check_electrum
+    check_script_instance "${SCRIPT_LUKS_SETUP_WALLET}"
+    check_script_instance "${SCRIPT_ELECTRUM_WRAPPER}"
+    check_script_instance "${SCRIPT_SAVE_WALLET_METADATA}"
+    check_script_instance "${SCRIPT_DISPLAY_WALLET_METADATA}"
+    check_script_instance "${SCRIPT_LUKS_CHANGE_PASSPHRASE}"
+    check_script_instance "${SCRIPT_LUKS_ADD_PASSPHRASE}"
+
+    local logging_window="Electrum wrapper status logging"
+    local container_file_path="${WALLET_MEDIA_MOUNT_POINT}/${WALLET_CONTAINER_FILE}"
+    local electrum_data_dir_path="${LUKS_WALLET_MOUNT_POINT}/${LUKS_ELECTRUM_DATA_DIR}"
+    local electrum_wallet_dir_path="${LUKS_WALLET_MOUNT_POINT}/${LUKS_ELECTRUM_DATA_DIR}/${ELECTRUM_WALLET_DIR}"
+    local wallet_metadata_dir="${LUKS_WALLET_MOUNT_POINT}/${LUKS_WALLET_METADATA_DIR}"
+
+    setup_logging_coproc "${logging_window}"
+
+    #--- identify the installed Electrum
+    local electrum_version
+    find_installed_electrum "${ELECTRUM_DIR}" electrum_version
+    if [ -z "${electrum_version}" ]; then
+        fatal "error: can't find a unique Electrum installation under ${ELECTRUM_DIR}"
+    fi
+    local electrum_path="${ELECTRUM_DIR}/${electrum_version}/${ELECTRUM_PACKAGED_SCRIPT_NAME}"
+
+    #--- load the wallet LUKS volume
+
+    check_media_mount "${WALLET_MEDIA_MOUNT_POINT}"
+
+    load_dm_crypt
+
+    make_mount_point "${LUKS_WALLET_MOUNT_POINT}"
+
+    local passphrase
+    luks_open "${container_file_path}" "${LUKS_WALLET_DEVICE_NAME}" passphrase
+
+    luks_mount "${LUKS_WALLET_DEVICE_NAME}" "${LUKS_WALLET_MOUNT_POINT}"
+
+    local text1 text2
+    if [ ! -e "${electrum_data_dir_path}" ]; then
+        text1="Can't access the Electrum data directory. "
+        text2="This happens only if luks-setup-wallet-dir was run halfway somehow artificially."
+        info "${text1}${text2}"
+    else
+        #--- list wallets before running Electrum
+        log_info "listing wallets before running Electrum"
+        local wallets_before=()
+        dir_files "${electrum_wallet_dir_path}" wallets_before
+
+        #--- invoke Electrum
+        log_info "Running ${electrum_path} using data directory ${electrum_data_dir_path}"
+        local output
+        output=$( "${electrum_path}" --offline --dir="${electrum_data_dir_path}" 2>&1)
+
+        #--- postprocess
+        if [ "$?" != '0' ]; then
+            text1="Failed running Electrum; ${output}"
+            info "${text1}"
+        else
+            #--- list wallets again
+            log_info "listing wallets after running Electrum"
+            local wallets_after=()
+            dir_files "${electrum_wallet_dir_path}" wallets_after
+
+            # take diff between wallets_before and wallets_after, and ask user to save metadata of new wallets
+            save_metadata_new_wallets wallets_before wallets_after "${wallet_metadata_dir}"
+        fi
+    fi
+
+    #--- unmount and close the wallet LUKS volume
+
+    luks_umount "${LUKS_WALLET_MOUNT_POINT}"
+
+    luks_close "${LUKS_WALLET_DEVICE_NAME}"
+
+    allsteps_done "${logging_window}"
+
+    wait_coproc
+}
+
+main
+
+# end
