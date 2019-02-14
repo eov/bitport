@@ -918,31 +918,45 @@ do_save_metadata() {
 }
 
 set_pinentry_timeout() {
-    local gpg_agent_conf="${HOME}/.gnupg/gpg-agent.conf"
-    local new_gpg_agent_conf=$(/bin/mktemp)
+    local gpg_dir="${HOME}/.gnupg"
+    local gpg_agent_conf="${gpg_dir}/gpg-agent.conf"
+    local timeout_line="pinentry-timeout ${PINENTRY_TIMEOUT}"
 
-    local timeout_line_pattern='[ ]*pinentry-timeout[ ]+[0-9]+( .*|$)?'
-    # sed command to comment out the line matching the pattern ^${timeout_line_pattern} and add a new config line:
-    # pinentry-timeout ${PINENTRY_TIMEOUT}
-    local sed_command="s/(^${timeout_line_pattern})/##\1/;/^##${timeout_line_pattern}/a pinentry-timeout ${PINENTRY_TIMEOUT}"
+    if [ ! -f "${gpg_agent_conf}" ]; then
+        log_info "creating ${gpg_agent_conf}"
+        /bin/mkdir -p "${gpg_dir}"
+        /bin/echo "${timeout_line}" > "${gpg_agent_conf}"
+    else
+        local timeout_line_pattern="^pinentry-timeout ${PINENTRY_TIMEOUT}$"
+        local output status
+        output=$(/bin/grep -E "${timeout_line_pattern}" "${gpg_agent_conf}")
+        status=$?
+        if [ "${status}" = 0 ]; then
+            log_info "${gpg_agent_conf} already has ${timeout_line}"
+            return
+        else
+            local timeout_line_pattern_else='[ ]*pinentry-timeout[ ]+[0-9]+( .*|$)'
+            local sed_command="s/(^${timeout_line_pattern_else})/##\1/"
+            local new_gpg_agent_conf=$(/bin/mktemp)
+            output=$( /bin/sed \
+                          -E \
+                          -e "${sed_command}" \
+                          "${gpg_agent_conf}" 2>&1 > ${new_gpg_agent_conf} )
+            status="$?"
+            if [ "${status}" != 0 ]; then
+                log_error "error: sed failed; ${output}"
+                return
+            fi
 
-    local output status
-    output=$( /bin/sed \
-                  -E \
-                  -e "${sed_command}" \
-                  "${gpg_agent_conf}" 2>&1 > ${new_gpg_agent_conf} )
-    status="$?"
-    if [ "${status}" != 0 ]; then
-        log_error "error: sed failed; ${output}"
-        return
-    fi
-
-    log_info "changing pinentry-timeout in ${gpg_agent_conf} to ${PINENTRY_TIMEOUT}"
-    output=$( /bin/mv --force "${new_gpg_agent_conf}" "${gpg_agent_conf}" )
-    status="$?"
-    if [ "${status}" != 0 ]; then
-        log_error "error: mv ${new_gpg_agent_conf} ${gpg_agent_conf}; ${output}"
-        return
+            log_info "changing pinentry-timeout in ${gpg_agent_conf} to ${PINENTRY_TIMEOUT}"
+            output=$( /bin/mv --force "${new_gpg_agent_conf}" "${gpg_agent_conf}" )
+            status="$?"
+            if [ "${status}" != 0 ]; then
+                log_error "error: mv ${new_gpg_agent_conf} ${gpg_agent_conf}; ${output}"
+                return
+            fi
+            /bin/echo "${timeout_line}" >> "${gpg_agent_conf}"
+        fi
     fi
 
     # find current processes of gpg-agent

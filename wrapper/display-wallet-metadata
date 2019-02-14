@@ -109,6 +109,9 @@ display_metadata() {
     local wallet_metadata_path="${dialog_output}"
     local wallet_metadata_file=$(/usr/bin/basename "${wallet_metadata_path}")
 
+    # extend gpg passphrase entry timeout
+    set_pinentry_timeout
+
     # loop to allow GPG passphrase errors
     local errfile=$(/bin/mktemp)
     local gpg_output
