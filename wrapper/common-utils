@@ -248,11 +248,11 @@ luks_format() {
         log_info "Setting up a LUKS volume within the container file."
         # special characters possibly included in passphrase will not get interpreted by echo
         local output
-        output=$( /bin/echo -En "${passphrase_ref}" | /sbin/cryptsetup --align-payload=1 --type luks2 luksFormat "${container_file}" - 2>&1 )
+        output=$( /bin/echo -En "${passphrase_ref}" | /usr/bin/sudo /sbin/cryptsetup --align-payload=1 --type luks2 luksFormat "${container_file}" - 2>&1 )
         if [ "$?" = '0' ]; then
             log_info "Successfully formated the LUKS volume within the container file."
         else
-            fatal "Failed setting up a LUKS volume ${output}"
+            fatal "Failed setting up a LUKS volume; ${output}"
         fi
     fi
 }
