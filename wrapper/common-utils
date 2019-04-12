@@ -139,7 +139,7 @@ create_container() {
         local available_mb=$(/bin/df --output=avail --block-size=1M "${media_mount_point}" | /bin/grep -v 'Avail')
 
         local minimum_clearance_mb='100'
-        local suggested_size_mb='50'
+        local suggested_size_mb='100'
         local minimum_size_mb='20'
         local maximum_size_mb=$(("${available_mb}" - "${minimum_clearance_mb}"))
 
@@ -152,7 +152,7 @@ create_container() {
         fi
 
         local text1="<b>Specify the LUKS container file size in MB.\n</b>"
-        local text2="<b>Recommended size is around ${minimum_size_mb} MB ~ 100 MB.\n</b>"
+        local text2="<b>Recommended size is around ${suggested_size_mb} MB. Should be >= ${minimum_size_mb} MB.\n</b>"
         local text3="(The media partition has about ${available_mb} MB unused space.)\n"
         local dialog_output=$(/usr/bin/yad \
                                   --form \
