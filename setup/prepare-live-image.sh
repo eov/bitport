@@ -68,9 +68,13 @@ prepare_live_image() {
         exit 1
     fi
 
-    # Create directories for live image files.
+    # Create the directory for live image files if it doesn't exist.
     /bin/echo "Creating directory ${image_root}/live"
     /bin/mkdir -p "${image_root}/live"
+
+    # Clean old files
+    /bin/echo "Cleaning old vmlinuz and initrd.img in ${image_root}/live"
+    /bin/rm -f ${image_root}/live/*
 
     #--- Squash filesystem
 
@@ -97,8 +101,8 @@ prepare_live_image() {
     /bin/echo "Copying vmlinuz and initrd.img to ${image_root}/live"
 
     # Find kernel files under "${chroot_dir}/boot"
-    local initrd_path vmlinuz_path config_path system_map_path
-    find_kernel_files "${chroot_dir}/boot" initrd_path vmlinuz_path config_path system_map_path
+    local vmlinuz_path initrd_path config_path system_map_path
+    find_kernel_files "${chroot_dir}" vmlinuz_path initrd_path config_path system_map_path
     local initrd_file=$(/usr/bin/basename "${initrd_path}")
     local vmlinuz_file=$(/usr/bin/basename "${vmlinuz_path}")
 
@@ -195,27 +199,34 @@ _EOD
 }
 
 find_kernel_files() {
-    local boot_dir="$1"
-    local -n initrd_path_ref="$2"
-    local -n vmlinuz_path_ref="$3"
+    local chroot_dir="$1"
+    local -n vmlinuz_path_ref="$2"
+    local -n initrd_path_ref="$3"
     local -n config_path_ref="$4"
     local -n system_map_path_ref="$5"
 
-    local initrd_glob="${boot_dir}/initrd*"
-    local vmlinuz_glob="${boot_dir}/vmlinuz*"
-    local config_glob="${boot_dir}/config*"
-    local system_map_glob="${boot_dir}/System.map*"
+    local vmlinuz_glob="${chroot_dir}/boot/vmlinuz*"
+    local initrd_glob="${chroot_dir}/boot/initrd*"
+    local config_glob="${chroot_dir}/boot/config*"
+    local system_map_glob="${chroot_dir}/boot/System.map*"
 
     shopt -s nullglob
-    find_glob_match_one ${initrd_glob} initrd_path_ref
-    find_glob_match_one ${vmlinuz_glob} vmlinuz_path_ref
-    find_glob_match_one ${config_glob} config_path_ref
-    find_glob_match_one ${system_map_glob} system_map_path_ref
+    find_glob_match_one vmlinuz_glob vmlinuz_path_ref
+    if [ $? = 1 ]; then
+        vmlinuz_prefix='vmlinuz'
+        real_vmlinuz=$(/bin/readlink "${chroot_dir}/${vmlinuz_prefix}")
+        /bin/echo "Hint: Currently used version of the kernel is ${chroot_dir}/${real_vmlinuz}"
+        /bin/echo "Hint: Please remove other versions (including initrd etc.) and run this script again."
+        exit 1
+    fi
+    find_glob_match_one initrd_glob initrd_path_ref
+    find_glob_match_one config_glob config_path_ref
+    find_glob_match_one system_map_glob system_map_path_ref
     shopt -u nullglob
 }
 
 find_glob_match_one() {
-    local glob_exp="$1"
+    local -n glob_exp="$1"
     local -n path_ref="$2"
 
     local files=(${glob_exp})
@@ -226,7 +237,7 @@ find_glob_match_one() {
         path_ref="${files[0]}"
     else
         /bin/echo "error: found more than a single match for ${glob_exp}"
-        exit 1
+        return 1
     fi
 }
 
