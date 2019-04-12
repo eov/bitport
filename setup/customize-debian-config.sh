@@ -36,10 +36,12 @@ main() {
     fi
 
     local customization=(
+        # all entries should be absolute file paths
         '/etc/lightdm/lightdm.conf'
         '/etc/sudoers'
         '/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml'
         '/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/thunar.xml'
+        '/usr/local/share/icons/electrum.png'
     )
 
     local cust dest_path dest_orig
@@ -53,6 +55,10 @@ main() {
             else
                 /usr/bin/sudo /bin/touch "${dest_orig}"
             fi
+        fi
+        parent_dir=$(/usr/bin/dirname "${dest_path}")
+        if [ ! -e "${parent_dir}" ]; then
+            /usr/bin/sudo /bin/mkdir "${parent_dir}"
         fi
         /usr/bin/sudo /bin/cp "${code_dir}/debian${cust}" "${dest_path}"
     done

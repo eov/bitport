@@ -93,16 +93,9 @@ main() {
 
     # copy Electrum wrapper desktop launchers to ${chroot_dir}/usr/local/share/applications/
     local chroot_launcher_dir="${chroot_dir}/usr/local/share/applications"
-    /bin/echo "copying ${code_dir}/launcher/*.desktop to ${chroot_launcher_dir}"
+    /bin/echo "copying ${code_dir}/launcher/* to ${chroot_launcher_dir}"
     /usr/bin/sudo /bin/mkdir -p "${chroot_launcher_dir}"
-    local launchers=( ${code_dir}/launcher/*.desktop )
-    local launcher_path launcher
-    for launcher_path in "${launchers[@]}"; do
-        launcher=$(basename "${launcher_path}")
-        /bin/cat "${launcher_path}" \
-            | /bin/sed -e "s/\${ELECTRUM_VERSION}/${top_level}/" \
-            | /usr/bin/sudo /usr/bin/tee "${chroot_launcher_dir}/${launcher}" > /dev/null
-    done
+    /usr/bin/sudo /bin/cp -r "${code_dir}/launcher/." "${chroot_launcher_dir}"
 }
 
 

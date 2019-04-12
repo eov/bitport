@@ -263,7 +263,7 @@ This script installs Electrum, its wrapper code and launchers as follows :
 * expand `Electrum-?.?.?.tar.gz` into `${LIVE_BOOT_BASE}/electrum/`
 * copy `${LIVE_BOOT_BASE}/electrum/Electrum-?.?.?/` to `${chroot_dir}/opt/electrum/`
 * copy `${code_dir}/wrapper/` to `${chroot_dir}/opt/electrum/`
-* copy `${code_dir}/launcher/*` to `${chroot_dir}/usr/local/share/applications/` replacing ${ELECTRUM_VERSION} with the actual Electrum version.
+* copy `${code_dir}/launcher/*` to `${chroot_dir}/usr/local/share/applications/`
 
 ## Customize Debian configuration
 
@@ -278,6 +278,7 @@ This copies the following custom configuration files:
 * `/etc/sudoers` for sudo without password for these commands: modprobe, cryptsetup, e2fsck, mkfs.ext2, mount, umount, mkdir, chown, shutdown.
 * `/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml` for setting font Xft DPI and disabling cursor blinking.
 * `/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/thunar.xml` for setting default view of the file browser.
+* `/usr/local/share/icons/electrum.png` for the Electrum launcher icon.
 
 ## Prepare live system image
 
