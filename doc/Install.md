@@ -106,15 +106,10 @@ First we set the hostname and obtain package updates from the Debian package rep
 ```
   [chroot]# /bin/echo debian-live > /etc/hostname
   [chroot]# 
-  [chroot]# /bin/cat /etc/hosts | /bin/sed -E -e '/127.0.0.1\s+localhost/a 127.0.0.1 debian-live' > /etc/hosts.temp
-  [chroot]# /bin/mv /etc/hosts /etc/hosts.old
-  [chroot]# /bin/mv /etc/hosts.temp /etc/hosts
-  [chroot]# 
   [chroot]# /usr/bin/apt-get update
   ...
   [chroot]# 
 ```
-What the sed script above does is to  add a line `127.0.0.1 debian-live` in `/etc/hosts` so you can do it manually instead.
 
 Find the exact package name of linux-image that matches the Debian version for the target live system (might not be the same as the build host system) :
 ```
@@ -146,7 +141,7 @@ install these desktop packages and their dependency packages :
     xfce4-power-manager xfce4-battery-plugin xfce4-clipman \
     xfce4-clipman-plugin xfce4-notes xfce4-cpugraph-plugin \
     xfce4-screenshooter xfce4-sensors-plugin xfce4-taskmanager \
-    xinit vim thunar lightdm leafpad \
+    xinit vim thunar lightdm mousepad \
     ristretto feh mupdf \
     sudo diceware man-db manpages
   ...
@@ -157,6 +152,47 @@ The package script of keyboard-configuration will ask to choose the keyboard lay
 Select the best one, and follow the instruction of Debian install scripts.
 
 These packages are a sort of minimal set that supports XFCE desktop, and you can add more packages if needed.
+
+#### Possible errors
+
+The above command apt-get install might fail with the following error:
+```
+  Setting up udisks2 (2.8.1-4) ...
+  Failed to scan devices: No such file or directory
+  dpkg: error processing package udisks2 (--configure):
+  installed udisks2 package post-installation script subprocess returned error exit status 1
+```
+This is known to be a bug of Debian Buster (https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=917633).
+A workaround is to patch `${LIVE_BOOT_BASE}/chroot/var/lib/dpkg/info/udisks2.postinst` so that the script doesn't stop when udevadm command fails:
+```
+@@ -4,7 +4,7 @@ set -e
+
+ if [ "$1" = "configure" ]; then
+     # we ship udev rules, so trigger an update
+-    udevadm trigger --subsystem-match=block --action=change
++    udevadm trigger --subsystem-match=block --action=change || true
+
+ fi
+```
+Now we can finish configuring the packages left unconfigured:
+```
+  [chroot]# dpkg --configure -a
+  Setting up udisks2 (2.8.1-4) ...
+  Failed to scan devices: No such file or directory
+  Created symlink /etc/systemd/system/graphical.target.wants/udisks2.service → /lib/systemd/system/udisks2.service.
+  Setting up gvfs-daemons (1.38.1-5) ...
+  Setting up gvfs:amd64 (1.38.1-5) ...
+  [chroot]# 
+```
+
+Now add the line `127.0.0.1 debian-live` in `/etc/hosts`. The same thing can be done by manually editting the file.
+```
+  [chroot]# /bin/cat /etc/hosts | /bin/sed -E -e '/127.0.0.1\s+localhost/a 127.0.0.1 debian-live' > /etc/hosts.temp
+  [chroot]# /bin/mv /etc/hosts /etc/hosts.old
+  [chroot]# /bin/mv /etc/hosts.temp /etc/hosts
+  [chroot]# 
+```
+
 
 ### Install Electrum dependency packages in the chroot environment
 
